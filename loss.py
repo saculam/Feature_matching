@@ -1,38 +1,34 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-class SelfSupervisedLoss(nn.Module):
-    def __init__(self, lambda_desc=250, lambda_dist=1.0):
-        super().__init__()
-        self.lambda_desc = lambda_desc
-        self.lambda_dist = lambda_dist
-    
-    def forward(self, scores1, desc1, scores2, desc2):
 
-        kp_loss = 1.0 - (torch.mean(scores1) + torch.mean(scores2))/2
- 
-        dist_loss = 1.0 / (self._spatial_variance(scores1) + self._spatial_variance(scores2) + 1e-6)
+class MatchingLoss(nn.Module):
+    def __init__(self):
+        super(MatchingLoss, self).__init__()
 
-        desc_loss = 1.0 - F.cosine_similarity(desc1, desc2, dim=1).mean()
+    def forward(self, feat1, feat2, keypoints1, keypoints2):
+        B, C, H, W = feat1.shape
         
-        total_loss = kp_loss + self.lambda_dist*dist_loss + self.lambda_desc*desc_loss
-        return total_loss
-    
-    def _spatial_variance(self, scores):
-        if scores.dim() == 4:
-            scores = scores.mean(dim=1)
-            
-        batch_size, height, width = scores.shape
-        grid_y, grid_x = torch.meshgrid(  
-            torch.arange(height, device=scores.device).float(),
-            torch.arange(width, device=scores.device).float(),
-            indexing='ij'
-        )
-        
-        prob = F.softmax(scores.view(batch_size, -1), dim=1).view_as(scores)
-        mean_x = (grid_x * prob).sum(dim=(-2, -1))
-        mean_y = (grid_y * prob).sum(dim=(-2, -1))
-        var_x = ((grid_x - mean_x.view(-1, 1, 1))**2 * prob).sum(dim=(-2, -1))
-        var_y = ((grid_y - mean_y.view(-1, 1, 1))**2 * prob).sum(dim=(-2, -1))
-        
-        return (var_x + var_y).mean()
+        # 将关键点坐标归一化到 [-1, 1]
+        kp1_norm = keypoints1.clone()
+        kp1_norm[..., 0] = (kp1_norm[..., 0] / (W - 1)) * 2 - 1
+        kp1_norm[..., 1] = (kp1_norm[..., 1] / (H - 1)) * 2 - 1
+
+        kp2_norm = keypoints2.clone()
+        kp2_norm[..., 0] = (kp2_norm[..., 0] / (W - 1)) * 2 - 1
+        kp2_norm[..., 1] = (kp2_norm[..., 1] / (H - 1)) * 2 - 1
+
+        grid1 = kp1_norm.unsqueeze(2)   # [B, N, 1, 2]
+        grid2 = kp2_norm.unsqueeze(2)   # [B, N, 1, 2]
+
+        # 从特征图中采样描述子
+        desc1 = F.grid_sample(feat1, grid1, align_corners=True).squeeze(-1)  # [B, C, N]
+        desc2 = F.grid_sample(feat2, grid2, align_corners=True).squeeze(-1)  # [B, C, N]
+
+        # L2归一化描述子
+        desc1 = F.normalize(desc1, p=2, dim=1)
+        desc2 = F.normalize(desc2, p=2, dim=1)
+
+        dot = torch.sum(desc1 * desc2, dim=1)  # [B, N]
+        loss = torch.mean(1 - dot)
+        return loss
