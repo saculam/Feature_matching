@@ -1,107 +1,85 @@
-import argparse
-import os
-import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torchvision import transforms
-from models import supernet
-from dataset import UnsupervisedPFPascal
-from loss import SelfSupervisedLoss
 import matplotlib.pyplot as plt
+import torchvision.transforms as transforms
 from tqdm import tqdm
+import argparse
 
-def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # 数据加载
-    train_set = UnsupervisedPFPascal(args.dataset_path, 'train', args.img_size)
-    val_set = UnsupervisedPFPascal(args.dataset_path, 'val', args.img_size)
-    
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, 
-                            shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size,
-                          shuffle=False, num_workers=4, pin_memory=True)
-    
-    # 模型初始化
-    model = supernet().to(device)
-    
-    # 损失函数和优化器
-    criterion = SelfSupervisedLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5)
-    
-    # 训练记录
-    train_losses, val_losses = [], []
+from datasets import PFPascalDataset
+from models import FeatureMatchingNet
+from loss import MatchingLoss
+
+def train_model(dataset_path, model_save_path, epochs):
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor()
+    ])
+    dataset = PFPascalDataset(dataset_path, transform=transform)
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = FeatureMatchingNet(output_dim=128).to(device)
+    criterion = MatchingLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    all_losses = []
+    plt.ion()
+    fig, ax = plt.subplots()
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Loss')
+    line, = ax.plot([], [], 'b-')
+    plt.show()
+
     best_loss = float('inf')
-    
-    for epoch in range(args.epochs):
-        
-        # 训练阶段
-        model.train()
+    iteration = 0
+
+    for epoch in range(epochs):
         epoch_loss = 0.0
-        tqdm_desc = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}')
-        for img1, img2 in tqdm_desc:
-            img1, img2 = img1.to(device), img2.to(device)
-            
+        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", ncols=100)
+        for batch in progress_bar:
+            image1 = batch["image1"].to(device)
+            image2 = batch["image2"].to(device)
+            keypoints1 = batch["keypoints1"].to(device)  # [B, N, 2]
+            keypoints2 = batch["keypoints2"].to(device)
+
             optimizer.zero_grad()
-            scores1, desc1 = model(img1)
-            scores2, desc2 = model(img2)
-            
-            loss = criterion(scores1, desc1, scores2, desc2)
+            feat1 = model(image1)
+            feat2 = model(image2)
+            loss = criterion(feat1, feat2, keypoints1, keypoints2)
             loss.backward()
             optimizer.step()
-            
-            epoch_loss += loss.item()
-            tqdm_desc.set_postfix(loss=loss.item())
-        # 验证阶段
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for img1, img2 in val_loader:
-                img1, img2 = img1.to(device), img2.to(device)
-                scores1, desc1 = model(img1)
-                scores2, desc2 = model(img2)
-                val_loss += criterion(scores1, desc1, scores2, desc2).item()
-        # 记录损失
-        train_loss = epoch_loss / len(train_loader)
-        val_loss /= len(val_loader)
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        
-        # 更新学习率
-        scheduler.step(val_loss)
-        
-        # 保存最佳模型
-        if val_loss < best_loss:
-            best_loss = val_loss
-            torch.save(model.state_dict(), os.path.join(args.output_dir, 'best_model.pth'))
-        
-        # 保存检查点
-        if (epoch+1) % args.save_interval == 0:
-            torch.save(model.state_dict(), 
-                      os.path.join(args.output_dir, f'epoch_{epoch+1}.pth'))
-        
-        # 打印信息
-        print(f'Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
-    
-    # 保存最终模型和loss曲线
-    torch.save(model.state_dict(), os.path.join(args.output_dir, 'final_model.pth'))
-    plt.plot(train_losses, label='Train')
-    plt.plot(val_losses, label='Validation')
-    plt.legend()
-    plt.savefig(os.path.join(args.output_dir, 'loss_curve.png'))
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset_path', required=True)
-    parser.add_argument('--output_dir', default='output')
-    parser.add_argument('--img_size', type=int, default=512)
-    parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--save_interval', type=int, default=10)
+            loss_val = loss.item()
+            all_losses.append(loss_val)
+            epoch_loss += loss_val
+            iteration += 1
+
+            progress_bar.set_postfix(loss=f"{loss_val:.4f}")
+            line.set_data(range(len(all_losses)), all_losses)
+            ax.relim()
+            ax.autoscale_view()
+            plt.pause(0.001)
+
+        avg_epoch_loss = epoch_loss / len(dataloader)
+        print(f"Epoch {epoch+1} finished, Average Loss: {avg_epoch_loss:.4f}")
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            torch.save(model.state_dict(), model_save_path)
+            print(f"Best model updated and saved with average loss {best_loss:.4f}!")
+
+    plt.ioff()
+    plt.savefig('loss_curve.png')
+    print("Training complete, loss curve saved to loss_curve.png")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train feature matching network")
+    parser.add_argument('--dataset_path', type=str, required=True,
+                        help='PF-Pascal 数据集图片目录')
+    parser.add_argument('--model_save_path', type=str, required=True,
+                        help='保存模型权重的路径，例如 model.pth')
+    parser.add_argument('--epochs', type=int, default=10,
+                        help='训练轮数，默认为10')
     args = parser.parse_args()
-    
-    train(args)
+
+    train_model(args.dataset_path, args.model_save_path, args.epochs)
