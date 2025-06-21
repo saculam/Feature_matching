@@ -26,7 +26,7 @@ pip install torch torchvision numpy pillow moviepy scikit-image matplotlib tqdm
 
 ```bash
 python train.py \
-    --dataset_path ./data/PF-Pascal/images \
+    --dataset_path ./datasets/PF-dataset-PASCAL/JPEGImages \
     --model_save_path best.pth 
 ```
 
