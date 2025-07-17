@@ -1,70 +1,91 @@
 import argparse
 import numpy as np
+import cv2
 from PIL import Image, ImageDraw
 from moviepy.editor import VideoFileClip, ImageSequenceClip
-from skimage.feature import corner_harris, corner_peaks
 import torch
 import torchvision.transforms as transforms
+from collections import deque
 from models import FeatureMatchingNet
 
-
-def detect_keypoints(image_pil, max_points=200, min_distance=5):
-    gray = np.array(image_pil.convert("L"))
-    response = corner_harris(gray)
-    coords = corner_peaks(response, min_distance=min_distance)
-    if len(coords) > max_points:
-        scores = response[coords[:, 0], coords[:, 1]]
-        idx = np.argsort(scores)[::-1][:max_points]
-        coords = coords[idx]
-    return coords  # shape [N, 2], (y,x)
-
+def detect_keypoints(pil_img, max_kps=200, min_distance=10):
+    gray = np.array(pil_img.convert("L"))
+    orb = cv2.ORB_create(nfeatures=max_kps)
+    kps = orb.detect(gray, None)
+    selected_coords = []
+    for kp in sorted(kps, key=lambda k: -k.response):
+        x, y = int(kp.pt[0]), int(kp.pt[1])
+        if all(np.hypot(x - px, y - py) > min_distance for px, py in selected_coords):
+            selected_coords.append((x, y))
+        if len(selected_coords) >= max_kps:
+            break
+    return selected_coords
 
 def sample_descriptors(feature_map, keypoints):
     C, H, W = feature_map.shape
     keypoints = np.array(keypoints)
-    xs = keypoints[:, 1] / (W - 1) * 2 - 1
-    ys = keypoints[:, 0] / (H - 1) * 2 - 1
-    grid = torch.from_numpy(np.stack([xs, ys], axis=1)).float().unsqueeze(0).unsqueeze(2)  # [1,N,1,2]
+    if len(keypoints) == 0:
+        return torch.empty(0, C)
+    xs = keypoints[:, 0] / (W - 1) * 2 - 1
+    ys = keypoints[:, 1] / (H - 1) * 2 - 1
+    grid = torch.from_numpy(np.stack([xs, ys], axis=1)).float().unsqueeze(0).unsqueeze(2)
     descriptors = torch.nn.functional.grid_sample(feature_map.unsqueeze(0), grid, align_corners=True)
-    return descriptors.squeeze(0).squeeze(-1).T  # [N,C]
+    return descriptors.squeeze(0).squeeze(-1).T
 
-
-def match_descriptors(desc1, desc2, threshold=0.8):
-    desc1 = torch.nn.functional.normalize(desc1, p=2, dim=1)
-    desc2 = torch.nn.functional.normalize(desc2, p=2, dim=1)
-    sim = torch.matmul(desc1, desc2.T)  # [N1,N2]
-    top1 = torch.argmax(sim, dim=1)     # desc1 → desc2
-    reverse_sim = torch.matmul(desc2, desc1.T)
-    top2 = torch.argmax(reverse_sim, dim=1)  # desc2 → desc1
-
-    mutual = []
-    for i, j in enumerate(top1):
-        if top2[j] == i and sim[i, j] > threshold:
-            mutual.append((i, j.item()))
-    return mutual
-
-
-def rescale_points(keypoints, src_size, dst_size):
-    scale_x = dst_size[0] / src_size[0]
-    scale_y = dst_size[1] / src_size[1]
-    return [(x * scale_x, y * scale_y) for y, x in keypoints]
-
-
-def draw_all_matches(image_np, match_history):
-    img = Image.fromarray(image_np)
+def draw_full_trajectories(frame_np, tracked_points, max_length=20):
+    img = Image.fromarray(frame_np)
     draw = ImageDraw.Draw(img)
-    for (x1, y1), (x2, y2) in match_history:
-        draw.line((x1, y1, x2, y2), fill=(255, 0, 0), width=1)
-        draw.ellipse((x2 - 2, y2 - 2, x2 + 2, y2 + 2), fill=(0, 255, 0))
+    for pt in tracked_points:
+        if len(pt.positions) < 2:
+            continue
+        pts = pt.positions[-max_length:]
+        for i in range(len(pts) - 1):
+            alpha = (i + 1) / len(pts)
+            color = (int(255 * alpha), 0, 0)
+            draw.line((pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1]), fill=color, width=8)
+        x2, y2 = exponential_smoothing(pt.positions)
+        draw.ellipse((x2 - 6, y2 - 6, x2 + 6, y2 + 6), fill=(0, 255, 0))
     return np.array(img)
 
+class TrackedPoint:
+    def __init__(self, init_pos, init_desc, point_id):
+        self.positions = [init_pos]
+        self.descriptors = [init_desc]
+        self.id = point_id
+        self.lost_frames = 0
 
-def track_video(video_path, model_path, output_path, num_keypoints=200,
-                match_threshold=0.8, min_movement=3, max_movement=50):
+    def update(self, new_pos, new_desc):
+        self.positions.append(new_pos)
+        self.descriptors.append(new_desc)
+        self.lost_frames = 0
+
+    def mark_lost(self):
+        self.lost_frames += 1
+
+    def latest_position(self):
+        return self.positions[-1]
+
+    def smoothed_position(self, window=3):
+        pts = self.positions[-window:]
+        xs, ys = zip(*pts)
+        return (np.mean(xs), np.mean(ys))
+        
+def exponential_smoothing(track, alpha=0.3):
+    if len(track) < 2:
+        return track[-1]
+    x_prev, y_prev = track[-2]
+    x_curr, y_curr = track[-1]
+    x_smooth = alpha * x_curr + (1 - alpha) * x_prev
+    y_smooth = alpha * y_curr + (1 - alpha) * y_prev
+    return (x_smooth, y_smooth)
+
+def track_video(video_path, model_path, output_path,
+                num_keypoints, match_threshold,
+                trail_len, min_movement, max_movement):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = FeatureMatchingNet(output_dim=128)
+    model = FeatureMatchingNet(output_dim=128).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval().to(device)
+    model.eval()
 
     transform = transforms.Compose([
         transforms.Resize((256, 256)),
@@ -73,81 +94,121 @@ def track_video(video_path, model_path, output_path, num_keypoints=200,
 
     clip = VideoFileClip(video_path)
     fps = clip.fps
+    W, H = clip.size
     n_frames = int(fps * clip.duration)
-    W_orig, H_orig = clip.size
 
     annotated_frames = []
-    match_history = []
+    match_history = deque(maxlen=trail_len)
+    tracked_points = []
+    next_id = 0
+    MAX_LOST = 5
 
-    frame0_np = clip.get_frame(0)
-    frame0_pil = Image.fromarray(frame0_np)
-    frame0_resized = frame0_pil.resize((256, 256))
-    kps_prev = detect_keypoints(frame0_resized, max_points=num_keypoints)
-    input0 = transform(frame0_resized).unsqueeze(0).to(device)
-    with torch.no_grad():
-        feat_prev = model(input0)[0].cpu()
-    desc_prev = sample_descriptors(feat_prev, kps_prev)
-    kps_prev_orig = rescale_points(kps_prev, (256, 256), (W_orig, H_orig))
+    f0_np = clip.get_frame(0)
+    f0_pil = Image.fromarray(f0_np).resize((256, 256))
+    kps0 = detect_keypoints(f0_pil, num_keypoints)
+    feat0 = model(transform(f0_pil).unsqueeze(0).to(device))[0].cpu()
+    desc0 = sample_descriptors(feat0, kps0)
+    kps0_rescaled = [(x * W / 256, y * H / 256) for x, y in kps0]
+
+    # 初始化轨迹
+    for i, (pt, desc) in enumerate(zip(kps0_rescaled, desc0)):
+        tracked_points.append(TrackedPoint(pt, desc, next_id))
+        next_id += 1
 
     for i in range(1, n_frames):
-        t = i / fps
-        frame_np = clip.get_frame(t)
-        frame_pil = Image.fromarray(frame_np)
-        frame_resized = frame_pil.resize((256, 256))
-
-        kps_curr = detect_keypoints(frame_resized, max_points=num_keypoints)
-        if len(kps_prev) == 0 or len(kps_curr) == 0:
-            annotated_frames.append(frame_np)
-            kps_prev = kps_curr
-            kps_prev_orig = rescale_points(kps_prev, (256, 256), (W_orig, H_orig))
-            continue
-
-        input1 = transform(frame_resized).unsqueeze(0).to(device)
+        f1_np = clip.get_frame(i / fps)
+        f1_pil = Image.fromarray(f1_np).resize((256, 256))
+        kps1 = detect_keypoints(f1_pil, num_keypoints)
         with torch.no_grad():
-            feat_curr = model(input1)[0].cpu()
-        desc_curr = sample_descriptors(feat_curr, kps_curr)
+            feat1 = model(transform(f1_pil).unsqueeze(0).to(device))[0].cpu()
+        desc1 = sample_descriptors(feat1, kps1)
+        kps1_rescaled = [(x * W / 256, y * H / 256) for x, y in kps1]
 
-        mutual_matches = match_descriptors(desc_prev, desc_curr, threshold=match_threshold)
-        kps_curr_orig = rescale_points(kps_curr, (256, 256), (W_orig, H_orig))
+        used_indices = set()
+        new_tracked = []
 
-        valid_lines = []
-        for idx1, idx2 in mutual_matches:
-            x1, y1 = kps_prev_orig[idx1]
-            x2, y2 = kps_curr_orig[idx2]
-            dist = np.hypot(x2 - x1, y2 - y1)
-            if min_movement < dist < max_movement:
-                match_history.append(((x1, y1), (x2, y2)))
-                valid_lines.append(((x1, y1), (x2, y2)))
+        for pt in tracked_points:
+            last_pos = pt.latest_position()
+            last_desc = pt.descriptors[-1]
+            if len(desc1) == 0:
+                pt.mark_lost()
+                continue
 
-        annotated = draw_all_matches(frame_np, match_history)
+            sims = torch.nn.functional.cosine_similarity(last_desc.unsqueeze(0), desc1)
+            idx = torch.argmax(sims).item()
+            match_score = sims[idx].item()
+
+            if idx in used_indices or match_score < match_threshold:
+                pt.mark_lost()
+                continue
+
+            new_pos = kps1_rescaled[idx]
+            dx, dy = new_pos[0] - last_pos[0], new_pos[1] - last_pos[1]
+            disp = np.hypot(dx, dy)
+
+            if disp < 3:
+                new_pos = last_pos  
+            if disp > max_movement:
+                pt.mark_lost()
+                continue
+
+            if len(pt.positions) >= 3:
+                vx = pt.positions[-1][0] - pt.positions[-2][0]
+                vy = pt.positions[-1][1] - pt.positions[-2][1]
+                pred_x = pt.positions[-1][0] + 0.5 * vx
+                pred_y = pt.positions[-1][1] + 0.5 * vy
+                pred_dist = np.hypot(pred_x - new_pos[0], pred_y - new_pos[1])
+                if pred_dist > 15:  
+                    pt.mark_lost()
+                    continue
+
+            used_indices.add(idx)
+            pt.update(new_pos, desc1[idx])
+            new_tracked.append(pt)
+
+        for idx, (pt, desc) in enumerate(zip(kps1_rescaled, desc1)):
+            if idx not in used_indices:
+                new_tracked.append(TrackedPoint(pt, desc, next_id))
+                next_id += 1
+
+        tracked_points = [pt for pt in new_tracked if pt.lost_frames <= MAX_LOST]
+
+        # 可视化匹配
+        pt_pairs = []
+        for pt in tracked_points:
+            if len(pt.positions) < 2:
+                continue
+            smoothed = exponential_smoothing(pt.positions)
+            pt_pairs.append((pt.positions[-2], smoothed))
+
+        match_history.append(pt_pairs)
+        annotated = draw_full_trajectories(f1_np, tracked_points, max_length=20)
         annotated_frames.append(annotated)
-
-        kps_prev = kps_curr
-        desc_prev = desc_curr
-        kps_prev_orig = kps_curr_orig
 
     out_clip = ImageSequenceClip(annotated_frames, fps=fps)
     out_clip.write_videofile(output_path, codec="libx264", audio=False)
-    print(f"视频已保存至：{output_path}")
+    print(f"已生成：{output_path}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="逐帧特征点匹配，可视化连线并保存所有轨迹")
-    parser.add_argument("--video_path", required=True, help="输入视频路径")
-    parser.add_argument("--model_path", required=True, help="训练好的模型 .pth 文件")
-    parser.add_argument("--output_path", required=True, help="输出标注视频路径")
-    parser.add_argument("--num_keypoints", type=int, default=100, help="每帧检测的最大特征点数量")
-    parser.add_argument("--match_threshold", type=float, default=0.8, help="余弦相似度匹配阈值")
-    parser.add_argument("--min_movement", type=float, default=3.0, help="最小移动距离才连线")
-    parser.add_argument("--max_movement", type=float, default=50.0, help="最大允许连线的距离")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--video_path", required=True)
+    parser.add_argument("--model_path", required=True)
+    parser.add_argument("--output_path", required=True)
+    parser.add_argument("--num_keypoints", type=int, default=400)
+    parser.add_argument("--match_threshold", type=float, default=0.65)
+    parser.add_argument("--trail_len", type=int, default=15)
+    parser.add_argument("--min_movement", type=float, default=15.0)
+    parser.add_argument("--max_movement", type=float, default=70.0)
     args = parser.parse_args()
 
     track_video(
-        args.video_path,
-        args.model_path,
-        args.output_path,
+        video_path=args.video_path,
+        model_path=args.model_path,
+        output_path=args.output_path,
         num_keypoints=args.num_keypoints,
         match_threshold=args.match_threshold,
+        trail_len=args.trail_len,
         min_movement=args.min_movement,
-        max_movement=args.max_movement,
+        max_movement=args.max_movement
     )
